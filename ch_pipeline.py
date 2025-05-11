@@ -15,25 +15,37 @@ import pandas as pd
 
 # Configuration and Core Utilities
 from config import (
-    logger, # Use the centrally configured logger
+    logger,
     MIN_MEANINGFUL_TEXT_LEN,
-    MAX_DOCS_TO_PROCESS_PER_COMPANY
+    MAX_DOCS_TO_PROCESS_PER_COMPANY,
+    GEMINI_API_KEY,
+    GEMINI_MODEL_DEFAULT,
+    OPENAI_MODEL_DEFAULT # Added for fallback
 )
 
 # CH API Interactions
 from ch_api_utils import (
     get_ch_documents_metadata,
-    _fetch_document_content_from_ch # Renamed from _fetch_document_content
+    _fetch_document_content_from_ch
 )
 
 # Text Extraction
-from text_extraction_utils import extract_text_from_document, OCRHandlerType
+# Ensure text_extraction_utils.py is present in your project directory
+try:
+    from text_extraction_utils import extract_text_from_document, OCRHandlerType
+except ImportError:
+    logger.error("text_extraction_utils.py not found. Text extraction will fail.")
+    # Define a placeholder if not found to prevent outright crash at import time,
+    # but it will fail at runtime.
+    def extract_text_from_document(*args, **kwargs) -> Tuple[str, int, Optional[str]]:
+        return "Error: text_extraction_utils.py not found.", 0, "text_extraction_utils.py is missing."
+    OCRHandlerType = Any
 
-# AI Summarization
+
+# AI Summarization (these now return token counts)
 from ai_utils import gpt_summarise_ch_docs, gemini_summarise_ch_docs
 
-# --- Optional AWS Textract Import ---
-# We'll try to import it and set up a handler if requested.
+# Optional AWS Textract Import
 try:
     from aws_textract_utils import perform_textract_ocr, get_textract_cost_estimation, _initialize_aws_clients as initialize_textract_aws_clients
     TEXTRACT_AVAILABLE = True
@@ -43,36 +55,27 @@ except ImportError:
     get_textract_cost_estimation = None
     initialize_textract_aws_clients = None
     TEXTRACT_AVAILABLE = False
-    logger.warning("aws_textract_utils.py not found or failed to import. Textract OCR will not be available.")
+    logger.warning("aws_textract_utils.py not found. Textract OCR will not be available.")
 
 
 def find_group_companies(parent_co_no: str) -> list[str]:
-    """
-    Placeholder for group company discovery.
-    Currently, it only returns the parent company itself.
-    Future enhancement could involve querying APIs or databases for subsidiary information.
-    """
     logger.info(f"Group discovery for parent company {parent_co_no} currently returns only the parent. (Placeholder)")
     return [parent_co_no]
 
 
 def _save_raw_document_content(
     doc_content: Union[bytes, str, Dict],
-    doc_type_str: str, # 'pdf', 'xhtml', 'json'
+    doc_type_str: str,
     company_no: str,
-    ch_doc_code: str, # e.g., AA, CS01
+    ch_doc_code: str,
     doc_year: int,
     scratch_dir: Path
 ) -> Optional[Path]:
-    """Saves raw document content to the scratch directory."""
     file_extension_map = {"pdf": "pdf", "xhtml": "xhtml", "json": "json"}
     file_extension = file_extension_map.get(doc_type_str, "dat")
-    
-    # Create a more structured filename
     timestamp_str = datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')
     doc_filename_prefix = f"{company_no}_{ch_doc_code}_{doc_year}_{timestamp_str}"
     doc_save_path = scratch_dir / f"{doc_filename_prefix}.{file_extension}"
-
     try:
         if isinstance(doc_content, bytes):
             doc_save_path.write_bytes(doc_content)
@@ -92,11 +95,9 @@ def _save_raw_document_content(
 
 
 def _cleanup_scratch_directory(scratch_dir: Path, keep_days: int):
-    """Removes old files from the scratch directory."""
     if keep_days < 0:
         logger.info(f"Scratch cleanup skipped (keep_days < 0). Path: {scratch_dir}")
         return
-
     timestamp_cutoff = time.time() - (keep_days * 86400)
     num_files_cleaned = 0
     try:
@@ -120,133 +121,114 @@ def run_ch_document_pipeline_for_company(
     start_year: int,
     end_year: int,
     scratch_dir: Path,
-    use_textract: bool = False # New parameter
+    filter_keywords: Optional[List[str]] = None, # Added for keyword filtering
+    use_textract: bool = False
 ) -> Tuple[List[Dict[str, Any]], int, int]:
-    """
-    Runs the document fetching and text extraction part of the pipeline for a single company.
-
-    Args:
-        company_no: The company registration number.
-        selected_categories: List of CH document categories to fetch.
-        start_year: Start year for filtering documents.
-        end_year: End year for filtering documents.
-        scratch_dir: Directory to save temporary files.
-        use_textract: Whether to attempt Textract OCR for PDFs.
-
-    Returns:
-        A tuple:
-            - list_of_extracted_text_data (each dict contains 'company_no', 'ch_doc_type', 'year', 'source_format', 'text', 'error')
-            - total_pages_processed_by_ocr (int)
-            - total_pdfs_sent_to_ocr (int)
-    """
-    logger.info(f"Starting document pipeline for company: {company_no} (Textract OCR: {'Enabled' if use_textract else 'Disabled'})")
-    
+    logger.info(f"Starting document pipeline for company: {company_no} (Textract OCR: {'Enabled' if use_textract else 'Disabled'}, Keywords: {filter_keywords if filter_keywords else 'None'})")
     all_extracted_texts_data: List[Dict[str, Any]] = []
     total_pages_ocrd_for_company = 0
     pdfs_sent_to_ocr_for_company = 0
 
-    # 1. Get document metadata from CH
     doc_metadata_items, meta_error = get_ch_documents_metadata(company_no, selected_categories, start_year, end_year)
     if meta_error:
         logger.error(f"Failed to get document metadata for {company_no}: {meta_error}")
         all_extracted_texts_data.append({
             "company_no": company_no, "ch_doc_type": "METADATA_ERROR", "year": 0,
-            "source_format": "N/A", "text": "", "error": meta_error
+            "source_format": "N/A", "text": "", "error": meta_error,
+            "prompt_tokens": 0, "completion_tokens": 0 # Ensure these keys are present
         })
         return all_extracted_texts_data, 0, 0
-    
+
     if not doc_metadata_items:
         logger.warning(f"No document metadata found for {company_no} matching criteria.")
         return [], 0, 0
 
-    # Determine OCR handler based on user preference and availability
     ocr_handler_to_use: Optional[OCRHandlerType] = None
     if use_textract:
         if TEXTRACT_AVAILABLE and perform_textract_ocr and initialize_textract_aws_clients:
-            if initialize_textract_aws_clients(): # Ensure AWS clients are ready
+            if initialize_textract_aws_clients():
                 ocr_handler_to_use = perform_textract_ocr
-                logger.info(f"Textract OCR is enabled and will be used for PDFs for {company_no} if needed.")
+                logger.info(f"Textract OCR is enabled for PDFs for {company_no} if needed.")
             else:
-                logger.warning(f"Textract OCR was requested for {company_no}, but AWS clients could not be initialized. OCR will be skipped.")
+                logger.warning(f"Textract OCR requested for {company_no}, but AWS clients failed to initialize. OCR skipped.")
         else:
-            logger.warning(f"Textract OCR was requested for {company_no}, but 'aws_textract_utils' is not available or configured. OCR will be skipped.")
+            logger.warning(f"Textract OCR requested for {company_no}, but 'aws_textract_utils' unavailable/unconfigured. OCR skipped.")
 
     processed_doc_transaction_ids = set()
     docs_processed_count = 0
-
-    # Sort by date again just in case, and limit processing
     doc_metadata_items.sort(key=lambda x: x.get("date", "0000-00-00"), reverse=True)
 
     for item_meta in doc_metadata_items:
         if docs_processed_count >= MAX_DOCS_TO_PROCESS_PER_COMPANY:
             logger.info(f"{company_no}: Reached document processing limit ({MAX_DOCS_TO_PROCESS_PER_COMPANY}).")
             break
-        
-        # Deduplicate based on transaction ID or metadata link
+
         unique_doc_identifier = item_meta.get("transaction_id") or item_meta.get("links", {}).get("document_metadata")
         if not unique_doc_identifier or unique_doc_identifier in processed_doc_transaction_ids:
             if unique_doc_identifier: logger.debug(f"{company_no}: Skipping already processed doc (ID: {unique_doc_identifier})")
             continue
-        
+
         ch_doc_type_code = item_meta.get("type", "UNKNOWN_CH_TYPE")
         doc_date_str = item_meta.get("date", "")
         try:
             doc_year_val = int(doc_date_str[:4])
         except ValueError:
-            logger.warning(f"{company_no}: Could not parse year from date '{doc_date_str}' for doc {unique_doc_identifier}. Skipping.")
+            logger.warning(f"{company_no}: Could not parse year from '{doc_date_str}' for doc {unique_doc_identifier}. Skipping.")
             continue
-        
-        # Year filtering should ideally be done by get_ch_documents_metadata, but double-check
+
         if not (start_year <= doc_year_val <= end_year):
             continue
 
         logger.info(f"{company_no}: Processing document: Type '{ch_doc_type_code}', Date '{doc_date_str}', Desc '{item_meta.get('description', 'N/A')}' (ID: {unique_doc_identifier})")
-
-        # 2. Fetch actual document content
         doc_content_data, fetched_content_type, fetch_err = _fetch_document_content_from_ch(company_no, item_meta)
 
-        if fetch_err or not doc_content_data or fetched_content_type == "none":
-            logger.warning(f"{company_no}: Failed to fetch content for doc {unique_doc_identifier}. Error: {fetch_err or 'No content returned.'}")
-            all_extracted_texts_data.append({
-                "company_no": company_no, "ch_doc_type": ch_doc_type_code, "year": doc_year_val,
-                "source_format": "FETCH_ERROR", "text": "", "error": fetch_err or 'No content returned.'
-            })
-            if unique_doc_identifier: processed_doc_transaction_ids.add(unique_doc_identifier)
-            docs_processed_count += 1
-            continue
-
-        # Optionally save raw fetched document
-        _save_raw_document_content(doc_content_data, fetched_content_type, company_no, ch_doc_type_code, doc_year_val, scratch_dir)
-
-        # 3. Extract text from the document content
-        # Pass the selected ocr_handler (if any) to extract_text_from_document
-        extracted_text, pages_ocrd, extract_err = extract_text_from_document(
-            doc_content_data, fetched_content_type, company_no,
-            ocr_handler=ocr_handler_to_use if fetched_content_type == 'pdf' else None
-        )
-        
-        if pages_ocrd > 0: # If OCR was used and processed pages
-            total_pages_ocrd_for_company += pages_ocrd
-            pdfs_sent_to_ocr_for_company += 1
-
-        # Store result even if there was an error or no text
-        result_data = {
-            "company_no": company_no,
-            "ch_doc_type": ch_doc_type_code,
-            "year": doc_year_val,
-            "source_format": fetched_content_type.upper(),
-            "text": extracted_text,
-            "error": extract_err # This will be None if extraction was successful
+        current_doc_data = {
+            "company_no": company_no, "ch_doc_type": ch_doc_type_code, "year": doc_year_val,
+            "source_format": "FETCH_ERROR", "text": "", "error": None,
+            "prompt_tokens": 0, "completion_tokens": 0 # Ensure these keys are present
         }
-        all_extracted_texts_data.append(result_data)
 
-        if extract_err:
-            logger.warning(f"{company_no}: Error extracting text from doc {unique_doc_identifier} (Type: {fetched_content_type}): {extract_err}")
-        elif not extracted_text or len(extracted_text.strip()) < MIN_MEANINGFUL_TEXT_LEN / 2:
-            logger.warning(f"{company_no}: No significant text extracted for doc {unique_doc_identifier} (Type: {fetched_content_type}). Preview: '{extracted_text[:100]}...'")
+        if fetch_err or not doc_content_data or fetched_content_type == "none":
+            err_msg = fetch_err or 'No content returned.'
+            logger.warning(f"{company_no}: Failed to fetch content for doc {unique_doc_identifier}. Error: {err_msg}")
+            current_doc_data["error"] = err_msg
         else:
-            logger.info(f"{company_no}: Successfully extracted text from doc {unique_doc_identifier} (Type: {fetched_content_type}, Length: {len(extracted_text)} chars).")
-            
+            current_doc_data["source_format"] = fetched_content_type.upper()
+            _save_raw_document_content(doc_content_data, fetched_content_type, company_no, ch_doc_type_code, doc_year_val, scratch_dir)
+
+            extracted_text, pages_ocrd, extract_err = extract_text_from_document(
+                doc_content_data, fetched_content_type, company_no,
+                ocr_handler=ocr_handler_to_use if fetched_content_type == 'pdf' else None
+            )
+            current_doc_data["text"] = extracted_text
+            current_doc_data["error"] = extract_err
+
+            if pages_ocrd > 0:
+                total_pages_ocrd_for_company += pages_ocrd
+                pdfs_sent_to_ocr_for_company += 1
+
+            if extract_err:
+                logger.warning(f"{company_no}: Error extracting text from doc {unique_doc_identifier} (Type: {fetched_content_type}): {extract_err}")
+            elif not extracted_text or len(extracted_text.strip()) < MIN_MEANINGFUL_TEXT_LEN / 2:
+                logger.warning(f"{company_no}: No significant text from doc {unique_doc_identifier} (Type: {fetched_content_type}). Preview: '{extracted_text[:100]}...'")
+            else:
+                logger.info(f"{company_no}: Successfully extracted text from doc {unique_doc_identifier} (Type: {fetched_content_type}, Length: {len(extracted_text)} chars).")
+
+                # --- Placeholder for Keyword Filtering Logic ---
+                if filter_keywords and extracted_text:
+                    text_lower = extracted_text.lower()
+                    found_keywords = [kw for kw in filter_keywords if kw in text_lower]
+                    if not found_keywords:
+                        logger.info(f"{company_no}: Doc {unique_doc_identifier} - Text did not contain focus keywords. Not using for focused summary (full text still available if needed).")
+                        # Potentially set a flag or modify 'extracted_text' for the aggregator
+                        # For now, we'll just log. The aggregator will receive all text.
+                        # A more advanced implementation might return only relevant excerpts.
+                    else:
+                        logger.info(f"{company_no}: Doc {unique_doc_identifier} - Text contains focus keywords: {found_keywords}.")
+                # --- End Placeholder ---
+
+
+        all_extracted_texts_data.append(current_doc_data)
         if unique_doc_identifier: processed_doc_transaction_ids.add(unique_doc_identifier)
         docs_processed_count += 1
 
@@ -259,37 +241,22 @@ def run_batch_company_analysis(
     selected_categories: List[str],
     start_year: int,
     end_year: int,
-    ai_model_identifier: str, # e.g., "gpt-4o-mini" or "gemini-1.5-pro-latest"
+    model_prices_gbp: Dict[str, float],
     specific_ai_instructions: str = "",
-    base_scratch_dir: Optional[Path] = None, # Base for creating timestamped run folders
+    filter_keywords_str: Optional[str] = None, # New parameter from app.py
+    base_scratch_dir: Optional[Path] = None,
     keep_days: int = 7,
-    use_textract_ocr: bool = False # To control Textract usage
+    use_textract_ocr: bool = False
 ) -> Tuple[Optional[Path], Dict[str, Any]]:
     """
-    Main batch processing function for Companies House analysis.
-    Orchestrates fetching, text extraction, and AI summarization for companies in a CSV.
-
-    Args:
-        csv_path: Path to the input CSV file with company numbers.
-        selected_categories: List of CH document categories.
-        start_year: Start year for document filtering.
-        end_year: End year for document filtering.
-        ai_model_identifier: Name of the AI model to use for summarization.
-        specific_ai_instructions: Additional instructions for the AI.
-        base_scratch_dir: Optional base directory for scratch files. A timestamped subfolder will be created.
-        keep_days: How long to keep files in the run-specific scratch folder.
-        use_textract_ocr: Boolean flag to enable Textract OCR.
-
-    Returns:
-        A tuple: (output_csv_digest_path_or_None, batch_processing_metrics_dict).
+    Main batch processing function. CH Summaries will prioritize Gemini.
     """
-    
     run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     if base_scratch_dir:
         run_scratch_dir = base_scratch_dir / f"ch_run_{run_timestamp}"
     else:
         run_scratch_dir = Path(tempfile.gettempdir()) / f"ch_pipeline_scratch_{run_timestamp}"
-    
+
     try:
         run_scratch_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Batch run using scratch directory: {run_scratch_dir}")
@@ -300,17 +267,14 @@ def run_batch_company_analysis(
     output_data_rows: List[Dict[str, Any]] = []
     parent_company_numbers: List[str] = []
 
-    # 1. Read Company Numbers from CSV
     try:
         with open(csv_path, mode='r', newline='', encoding='utf-8-sig') as fh_csv:
             reader = csv.reader(fh_csv)
-            header = next(reader, None) # Skip header
+            header = next(reader, None)
             if header: logger.info(f"Input CSV header: {header}")
-            
             for i, row in enumerate(reader):
                 if row and row[0].strip():
                     company_no_cleaned = row[0].strip().upper().replace(" ", "").zfill(8)
-                    # Basic validation for 8 alphanumeric chars
                     if len(company_no_cleaned) == 8 and company_no_cleaned.isalnum():
                         parent_company_numbers.append(company_no_cleaned)
                     else:
@@ -324,266 +288,303 @@ def run_batch_company_analysis(
         return None, {"error": "Failed to read input CSV.", "notes": str(e_read_csv)}
 
     if not parent_company_numbers:
-        logger.warning("No valid company numbers loaded from CSV. Batch processing cannot continue.")
-        # Create an empty digest for consistency
+        logger.warning("No valid company numbers loaded. Batch processing cannot continue.")
         empty_digest_filename = f"digest_empty_input_{run_timestamp}.csv"
         empty_digest_path = run_scratch_dir / empty_digest_filename
-        try:
-            pd.DataFrame([]).to_csv(empty_digest_path, index=False, encoding='utf-8-sig')
+        try: pd.DataFrame([]).to_csv(empty_digest_path, index=False, encoding='utf-8-sig')
         except Exception as e_write_empty: logger.error(f"Failed to write empty input digest: {e_write_empty}")
         return empty_digest_path, {
             "notes": "No companies processed due to empty or invalid input CSV.",
-            "total_companies_processed": 0,
-            "aws_ocr_costs": {} # Empty cost dict
+            "total_companies_processed": 0, "aws_ocr_costs": {}, "ai_ch_summary_costs": {} # Ensure keys exist
         }
 
-    # --- Batch Processing Metrics ---
+    parsed_filter_keywords: Optional[List[str]] = None
+    if filter_keywords_str:
+        parsed_filter_keywords = [kw.strip().lower() for kw in filter_keywords_str.split(',') if kw.strip()]
+        if not parsed_filter_keywords: # If string was just commas or spaces
+            parsed_filter_keywords = None
+    if parsed_filter_keywords:
+        logger.info(f"Keyword filtering will be attempted with: {parsed_filter_keywords}")
+    else:
+        logger.info("No keyword filtering requested or keywords were empty.")
+
+
     batch_total_pages_ocrd = 0
     batch_total_pdfs_to_ocr = 0
     companies_successfully_summarized = 0
     companies_with_extraction_errors = 0
+    total_ch_summary_prompt_tokens = 0
+    total_ch_summary_completion_tokens = 0
 
-    # 2. Process each parent company
+    ch_summary_model_to_use = GEMINI_MODEL_DEFAULT
+    if not GEMINI_API_KEY:
+        logger.warning("GEMINI_API_KEY not found. Falling back to OpenAI default for CH summaries.")
+        ch_summary_model_to_use = OPENAI_MODEL_DEFAULT
+    logger.info(f"CH Document Summaries will use AI model: {ch_summary_model_to_use}")
+
+
     for parent_co_no in parent_company_numbers:
         logger.info(f">>> Processing parent company: {parent_co_no}")
-        # Placeholder: In a real scenario, find_group_companies would be more complex.
         group_member_co_numbers = find_group_companies(parent_co_no)
-        
         all_texts_for_group_summary: List[str] = []
         member_processing_logs: List[str] = []
         has_critical_extraction_error_for_group = False
 
         for member_co_no in group_member_co_numbers:
-            extracted_data, pages_ocrd_member, pdfs_to_ocr_member = run_ch_document_pipeline_for_company(
-                member_co_no, selected_categories, start_year, end_year, run_scratch_dir, use_textract_ocr
+            # Pass parsed_filter_keywords to the document pipeline
+            extracted_data_list, pages_ocrd_member, pdfs_to_ocr_member = run_ch_document_pipeline_for_company(
+                member_co_no, selected_categories, start_year, end_year, run_scratch_dir,
+                filter_keywords=parsed_filter_keywords, # Pass keywords here
+                use_textract=use_textract_ocr
             )
             batch_total_pages_ocrd += pages_ocrd_member
             batch_total_pdfs_to_ocr += pdfs_to_ocr_member
-            
+
             num_docs_with_text = 0
             num_docs_with_errors = 0
-
-            for data_item in extracted_data:
+            for data_item in extracted_data_list:
                 if data_item.get("error"):
                     num_docs_with_errors += 1
-                    has_critical_extraction_error_for_group = True # Flag if any doc in group had extraction error
-                    # Log the specific error for the document
+                    has_critical_extraction_error_for_group = True # Mark if any member had critical error
                     logger.warning(f"Error for {data_item['company_no']} Doc: {data_item['ch_doc_type']} Yr: {data_item['year']} - {data_item['error']}")
-
-                # Check if text is meaningful (not just an error message and meets length)
                 text_content = data_item.get("text", "")
+
+                # TODO: Implement actual filtering based on keywords for summarization input.
+                # If parsed_filter_keywords are active, 'text_content' here could be pre-filtered excerpts.
+                # For now, the placeholder in run_ch_document_pipeline_for_company just logs.
+                # The summarization below will receive all text that passes the length check.
+                # This part needs significant refinement for effective focused processing.
+
                 if text_content and "Error:" not in text_content and len(text_content.strip()) > MIN_MEANINGFUL_TEXT_LEN / 2:
                     all_texts_for_group_summary.append(
                         f"[Text from Company: {data_item['company_no']}, CH Doc Type: {data_item['ch_doc_type']}, "
                         f"Year: {data_item['year']}, Source Format: {data_item['source_format']}]\n{text_content}"
                     )
                     num_docs_with_text +=1
-            
             member_processing_logs.append(
-                f"{member_co_no} ({num_docs_with_text}/{len(extracted_data)} docs yielded usable text; {num_docs_with_errors} errors)"
+                f"{member_co_no} ({num_docs_with_text}/{len(extracted_data_list)} docs yielded usable text; {num_docs_with_errors} errors)"
             )
 
-        # 3. AI Summarization for the group
         final_summary_text = "No processable documents or text extracted that meets criteria for summarization."
         full_text_char_count = 0
+        current_summary_prompt_tokens = 0
+        current_summary_completion_tokens = 0
 
         if all_texts_for_group_summary:
             full_text_for_ai = "\n\n===[END OF DOCUMENT/SECTION]===\n\n".join(all_texts_for_group_summary)
             full_text_char_count = len(full_text_for_ai)
             logger.info(f"Combined text for AI summary (Parent Co: {parent_co_no}) has {full_text_char_count:,} chars from {len(all_texts_for_group_summary)} text blocks.")
 
-            if ai_model_identifier.startswith("gemini"):
-                final_summary_text = gemini_summarise_ch_docs(
-                    full_text_for_ai, parent_co_no, specific_ai_instructions, ai_model_identifier
+            # Add keyword context to specific instructions if keywords were used
+            current_specific_instructions = specific_ai_instructions
+            if parsed_filter_keywords:
+                keyword_instruction_addon = f" Please pay special attention to information related to the following keywords/topics: {', '.join(parsed_filter_keywords)}."
+                current_specific_instructions = f"{specific_ai_instructions.strip()} {keyword_instruction_addon}".strip()
+
+
+            if ch_summary_model_to_use.startswith("gemini"):
+                final_summary_text, p_tokens, c_tokens = gemini_summarise_ch_docs(
+                    full_text_for_ai, parent_co_no, current_specific_instructions, ch_summary_model_to_use
                 )
-            elif ai_model_identifier.startswith("gpt"):
-                final_summary_text = gpt_summarise_ch_docs(
-                    full_text_for_ai, parent_co_no, specific_ai_instructions, ai_model_identifier
+            elif ch_summary_model_to_use.startswith("gpt"):
+                final_summary_text, p_tokens, c_tokens = gpt_summarise_ch_docs(
+                    full_text_for_ai, parent_co_no, current_specific_instructions, ch_summary_model_to_use
                 )
             else:
-                logger.warning(f"Unknown AI model identifier prefix: '{ai_model_identifier}'. Skipping summarization.")
-                final_summary_text = f"Error: Unknown AI model ('{ai_model_identifier}') specified for summarization."
-            
+                logger.error(f"Logic error: ch_summary_model_to_use ('{ch_summary_model_to_use}') is not recognized. No summary.")
+                final_summary_text = f"Error: Internal model selection error for summarization."
+                p_tokens, c_tokens = 0,0
+
+            current_summary_prompt_tokens = p_tokens
+            current_summary_completion_tokens = c_tokens
+            total_ch_summary_prompt_tokens += current_summary_prompt_tokens
+            total_ch_summary_completion_tokens += current_summary_completion_tokens
+
             if "Error:" not in final_summary_text and "No content provided" not in final_summary_text:
                 companies_successfully_summarized +=1
         else:
-            logger.warning(f"No text was extracted for any member of parent group {parent_co_no}. No AI summary will be generated.")
+            logger.warning(f"No text extracted for parent group {parent_co_no}. No AI summary will be generated.")
             if has_critical_extraction_error_for_group:
                 companies_with_extraction_errors +=1
-
 
         output_data_rows.append({
             "parent_company_no": parent_co_no,
             "processed_group_members_log": "; ".join(member_processing_logs),
-            "summary_of_findings": final_summary_text.replace("\n", "  "), # Flatten for CSV
+            "summary_of_findings": final_summary_text.replace("\n", "  "), # Replace newlines for CSV
             "combined_text_char_count": full_text_char_count,
+            "summary_prompt_tokens": current_summary_prompt_tokens,
+            "summary_completion_tokens": current_summary_completion_tokens,
+            "keywords_used_for_filtering": ", ".join(parsed_filter_keywords) if parsed_filter_keywords else "N/A"
         })
-        if len(parent_company_numbers) > 1: # Small delay if processing multiple companies
-            time.sleep(0.5)
+        if len(parent_company_numbers) > 1: time.sleep(0.5) # Small delay between processing parent companies
 
-    # 4. Finalize batch results and costs
+    ai_summary_cost_gbp = 0.0
+    price_per_1k_tokens_ch_model = model_prices_gbp.get(ch_summary_model_to_use, 0.0)
+
+    if price_per_1k_tokens_ch_model > 0:
+        total_tokens_for_ch_summaries = total_ch_summary_prompt_tokens + total_ch_summary_completion_tokens
+        ai_summary_cost_gbp = (total_tokens_for_ch_summaries / 1000) * price_per_1k_tokens_ch_model
+
+    ai_summary_cost_metrics = {
+        "model_used_for_ch_summaries": ch_summary_model_to_use,
+        "total_prompt_tokens": total_ch_summary_prompt_tokens,
+        "total_completion_tokens": total_ch_summary_completion_tokens,
+        "estimated_cost_gbp": round(ai_summary_cost_gbp, 5)
+    }
+
     aws_cost_metrics = {}
     if use_textract_ocr and TEXTRACT_AVAILABLE and get_textract_cost_estimation:
         aws_cost_metrics = get_textract_cost_estimation(batch_total_pages_ocrd, batch_total_pdfs_to_ocr)
         logger.info(f"Final AWS Cost Estimation for CH Batch OCR: {aws_cost_metrics}")
-    elif use_textract_ocr: # Requested but not available/used
-        aws_cost_metrics = {"notes": "Textract OCR was requested but not available or not used. No OCR costs."}
-    else: # Not requested
+    elif use_textract_ocr:
+        aws_cost_metrics = {"notes": "Textract OCR requested but not available/used. No OCR costs."}
+    else:
         aws_cost_metrics = {"notes": "Textract OCR was not requested. No OCR costs."}
 
     batch_metrics = {
         "total_parent_companies_processed": len(parent_company_numbers),
         "companies_successfully_summarized": companies_successfully_summarized,
         "companies_with_extraction_errors_in_group": companies_with_extraction_errors,
-        "total_docs_considered_for_extraction_across_all_members": "N/A (Track per company in logs)", # More complex to sum up here
         "total_textract_pages_processed": batch_total_pages_ocrd,
         "total_pdfs_sent_to_textract": batch_total_pdfs_to_ocr,
         "aws_ocr_costs": aws_cost_metrics,
-        "ai_model_used_for_summaries": ai_model_identifier,
-        "run_timestamp": run_timestamp
+        "ai_ch_summary_costs": ai_summary_cost_metrics,
+        "run_timestamp": run_timestamp,
+        "keywords_applied_to_batch": ", ".join(parsed_filter_keywords) if parsed_filter_keywords else "N/A"
     }
 
-    # 5. Write output digest CSV
     output_csv_path = None
     if output_data_rows:
         digest_filename = f"digest_CH_analysis_report_{run_timestamp}.csv"
         output_csv_path = run_scratch_dir / digest_filename
         try:
             df_output = pd.DataFrame(output_data_rows)
-            # Ensure consistent column order
-            output_cols = ["parent_company_no", "processed_group_members_log", "summary_of_findings", "combined_text_char_count"]
+            output_cols = ["parent_company_no", "processed_group_members_log", "summary_of_findings",
+                           "combined_text_char_count", "summary_prompt_tokens", "summary_completion_tokens",
+                           "keywords_used_for_filtering"]
             df_output = df_output.reindex(columns=output_cols)
             df_output.to_csv(output_csv_path, index=False, encoding='utf-8-sig')
             logger.info(f"Batch processing complete. Output digest: {output_csv_path}")
         except Exception as e_write_digest:
-            logger.error(f"Failed to write final output digest CSV to {output_csv_path}: {e_write_digest}", exc_info=True)
-            output_csv_path = None # Indicate failure
+            logger.error(f"Failed to write final output digest CSV: {e_write_digest}", exc_info=True)
+            output_csv_path = None
             batch_metrics["error"] = "Failed to write output digest CSV."
-    elif parent_company_numbers: # Processed companies but no rows (e.g., all failed very early)
-        logger.warning("No data rows generated, though companies were processed. Creating an empty digest with notes.")
+    elif parent_company_numbers: # Processed companies but no rows (e.g., all errors or no text)
+        logger.warning("No data rows generated, though companies were processed. Creating empty digest with notes.")
         no_data_digest_filename = f"digest_processing_yielded_no_data_{run_timestamp}.csv"
         output_csv_path = run_scratch_dir / no_data_digest_filename
         try:
-            pd.DataFrame([{"parent_company_no": "N/A", 
-                           "processed_group_members_log": "All processed companies yielded no usable data for summary or encountered critical errors.", 
-                           "summary_of_findings": "No summary generated.", 
-                           "combined_text_char_count": 0}]).to_csv(output_csv_path, index=False, encoding='utf-8-sig')
+            pd.DataFrame([{"parent_company_no": "N/A",
+                           "processed_group_members_log": "All processed companies yielded no usable data for summary or encountered critical errors.",
+                           "summary_of_findings": "No summary generated.",
+                           "combined_text_char_count": 0,
+                           "summary_prompt_tokens":0, "summary_completion_tokens":0,
+                           "keywords_used_for_filtering": batch_metrics["keywords_applied_to_batch"]
+                           }]).to_csv(output_csv_path, index=False, encoding='utf-8-sig')
         except Exception as e_write_no_data: logger.error(f"Failed to write 'no data' digest: {e_write_no_data}")
         batch_metrics["notes"] = (batch_metrics.get("notes","") + " Processing yielded no data rows.").strip()
-    # (Empty input CSV case already handled and returns early)
 
-    # 6. Cleanup scratch directory
+
     _cleanup_scratch_directory(run_scratch_dir, keep_days)
-
     return output_csv_path, batch_metrics
 
 
-# --- Standalone Test Block ---
 if __name__ == '__main__':
+    # Setup for standalone test run
+    import os # Ensure os is imported for getenv
     logger.info("Running ch_pipeline.py as standalone test.")
     
-    # Check for necessary environment variables for a full test
-    # Note: AWS keys are not strictly required if use_textract_ocr is False for the test.
-    required_env_vars = ['OPENAI_API_KEY', 'CH_API_KEY'] # GEMINI_API_KEY optional for specific model test
-    if not all(os.getenv(var) for var in required_env_vars):
-        logger.critical(f"Standalone test requires missing env vars: {', '.join(var for var in required_env_vars if not os.getenv(var))}. Some tests may fail or be skipped.")
-    
-    # Create a dummy CSV for testing
-    test_csv_dir = Path(tempfile.mkdtemp(prefix="ch_pipeline_test_"))
+    # Ensure required environment variables are available for testing
+    required_env_vars_for_test = ['OPENAI_API_KEY', 'CH_API_KEY'] # GEMINI_API_KEY check is intrinsic
+    if not all(os.getenv(var) for var in required_env_vars_for_test):
+        logger.critical(f"Standalone test requires API keys (OPENAI_API_KEY, CH_API_KEY). Some tests may fail or be skipped if not set.")
+
+    test_model_prices = {
+        config.OPENAI_MODEL_DEFAULT: 0.0004, # Example: gpt-3.5-turbo if it's the default
+        "gpt-4o-mini": 0.00012,
+        config.GEMINI_MODEL_DEFAULT: 0.0028,
+        "gemini-1.5-flash-latest": 0.00028
+    }
+
+    test_csv_dir = Path(tempfile.mkdtemp(prefix="ch_pipeline_test_input_dir_"))
     standalone_test_csv_path = test_csv_dir / "test_ch_pipeline_input.csv"
-    # Use a known company number, e.g., Google UK or BP
-    test_company_no = os.getenv("TEST_COMPANY_NUMBER_CH", "03977602") # Google UK Ltd.
+    # Use an environment variable for the test company number, or a common default
+    test_company_no = os.getenv("TEST_COMPANY_NUMBER_CH", "00445790") # Example: ROLLS-ROYCE PLC
 
     with open(standalone_test_csv_path, "w", newline="", encoding="utf-8") as f_test_csv:
         csv_writer = csv.writer(f_test_csv)
-        csv_writer.writerow(["CompanyNumber", "OptionalOtherColumn"])
-        csv_writer.writerow([test_company_no, "Test Data"])
+        csv_writer.writerow(["CompanyNumber"])
+        csv_writer.writerow([test_company_no])
     logger.info(f"Created test input CSV: {standalone_test_csv_path} for company {test_company_no}")
 
     test_scratch_base = Path(tempfile.mkdtemp(prefix="ch_pipeline_test_scratch_base_"))
     logger.info(f"Using temporary base scratch for standalone test runs: {test_scratch_base}")
 
-    test_categories = ['accounts'] # Focus on accounts for testing
+    test_categories = ['accounts'] # Focus on accounts for potentially larger text
     current_test_year = datetime.datetime.now().year
-    test_start_year = current_test_year - 3
-    test_end_year = current_test_year -1 # Use previous years as current year might not have filings yet
+    # Look back further for more chance of documents for a test company
+    test_start_year, test_end_year = current_test_year - 5, current_test_year - 1
+    test_instructions = "Summarize key financial trends and any mention of strategic direction."
+    test_keywords = "profit, revenue, strategy"
 
-    test_instructions = "Highlight any changes in Total Assets and Net Profit After Tax year on year."
-
-    # --- Test 1: OpenAI without Textract ---
-    logger.info(f"\n--- Test Run with OpenAI (default model), Textract Disabled ---")
+    logger.info(f"\n--- Test Run: CH Summaries (Default AI), Textract Disabled, No Keywords ---")
     try:
-        result_path_o_no_ocr, metrics_o_no_ocr = run_batch_company_analysis(
-            csv_path=standalone_test_csv_path,
-            selected_categories=test_categories,
-            start_year=test_start_year,
-            end_year=test_end_year,
-            ai_model_identifier="gpt-4o-mini", # Or use OPENAI_MODEL_DEFAULT from config
+        result_path_gemini, metrics_gemini = run_batch_company_analysis(
+            csv_path=standalone_test_csv_path, selected_categories=test_categories,
+            start_year=test_start_year, end_year=test_end_year,
+            model_prices_gbp=test_model_prices,
             specific_ai_instructions=test_instructions,
+            filter_keywords_str=None, # Test without keywords first
             base_scratch_dir=test_scratch_base,
-            keep_days=0,
-            use_textract_ocr=False
+            keep_days=0, use_textract_ocr=False
         )
-        if result_path_o_no_ocr: logger.info(f"OpenAI (No OCR) Test Output Digest: {result_path_o_no_ocr}")
-        else: logger.error("OpenAI (No OCR) Test Run DID NOT produce an output digest path.")
-        logger.info(f"OpenAI (No OCR) Test Metrics: {json.dumps(metrics_o_no_ocr, indent=2)}")
-    except Exception as e_test1:
-        logger.error(f"Error during OpenAI (No OCR) test: {e_test1}", exc_info=True)
+        if result_path_gemini: logger.info(f"CH (Default AI) Test Output Digest: {result_path_gemini}")
+        else: logger.error("CH (Default AI) Test Run DID NOT produce an output digest path.")
+        logger.info(f"CH (Default AI) Test Metrics: {json.dumps(metrics_gemini, indent=2)}")
+    except Exception as e_test_default: logger.error(f"Error during CH (Default AI) test: {e_test_default}", exc_info=True)
 
-    # --- Test 2: OpenAI with Textract (if available) ---
-    if TEXTRACT_AVAILABLE and os.getenv("S3_TEXTRACT_BUCKET"): # Also check S3 bucket for good measure
-        logger.info(f"\n--- Test Run with OpenAI (default model), Textract Enabled ---")
+    logger.info(f"\n--- Test Run: CH Summaries (Default AI), Textract Disabled, WITH Keywords: '{test_keywords}' ---")
+    try:
+        result_path_keywords, metrics_keywords = run_batch_company_analysis(
+            csv_path=standalone_test_csv_path, selected_categories=test_categories,
+            start_year=test_start_year, end_year=test_end_year,
+            model_prices_gbp=test_model_prices,
+            specific_ai_instructions=test_instructions,
+            filter_keywords_str=test_keywords, # Test with keywords
+            base_scratch_dir=test_scratch_base,
+            keep_days=0, use_textract_ocr=False
+        )
+        if result_path_keywords: logger.info(f"CH (Keywords) Test Output Digest: {result_path_keywords}")
+        else: logger.error("CH (Keywords) Test Run DID NOT produce an output digest path.")
+        logger.info(f"CH (Keywords) Test Metrics: {json.dumps(metrics_keywords, indent=2)}")
+    except Exception as e_test_keywords: logger.error(f"Error during CH (Keywords) test: {e_test_keywords}", exc_info=True)
+
+
+    if TEXTRACT_AVAILABLE and os.getenv("S3_TEXTRACT_BUCKET") and os.getenv("AWS_ACCESS_KEY_ID"): # Add key check for Textract
+        logger.info(f"\n--- Test Run: CH Summaries (Default AI), Textract Enabled, No Keywords ---")
         try:
-            result_path_o_ocr, metrics_o_ocr = run_batch_company_analysis(
-                csv_path=standalone_test_csv_path,
-                selected_categories=test_categories,
-                start_year=test_start_year,
-                end_year=test_end_year,
-                ai_model_identifier="gpt-4o-mini",
+            result_path_ocr, metrics_ocr = run_batch_company_analysis(
+                csv_path=standalone_test_csv_path, selected_categories=test_categories,
+                start_year=test_start_year, end_year=test_end_year,
+                model_prices_gbp=test_model_prices,
                 specific_ai_instructions=test_instructions,
+                filter_keywords_str=None,
                 base_scratch_dir=test_scratch_base,
-                keep_days=0,
-                use_textract_ocr=True
+                keep_days=0, use_textract_ocr=True
             )
-            if result_path_o_ocr: logger.info(f"OpenAI (OCR) Test Output Digest: {result_path_o_ocr}")
-            else: logger.error("OpenAI (OCR) Test Run DID NOT produce an output digest path.")
-            logger.info(f"OpenAI (OCR) Test Metrics: {json.dumps(metrics_o_ocr, indent=2)}")
-        except Exception as e_test2:
-            logger.error(f"Error during OpenAI (OCR) test: {e_test2}", exc_info=True)
+            if result_path_ocr: logger.info(f"CH (OCR) Test Output Digest: {result_path_ocr}")
+            else: logger.error("CH (OCR) Test Run DID NOT produce an output digest path.")
+            logger.info(f"CH (OCR) Test Metrics: {json.dumps(metrics_ocr, indent=2)}")
+        except Exception as e_test_ocr: logger.error(f"Error during CH (OCR) test: {e_test_ocr}", exc_info=True)
     else:
-        logger.warning("\n--- Skipping Textract enabled test as TEXTRACT_AVAILABLE is False or S3_TEXTRACT_BUCKET not set. ---")
+        logger.warning("\n--- Skipping Textract enabled test: TEXTRACT_AVAILABLE is False or S3_TEXTRACT_BUCKET/AWS Keys not set. ---")
 
-    # --- Test 3: Gemini (if available) without Textract ---
-    if os.getenv("GEMINI_API_KEY"):
-        logger.info(f"\n--- Test Run with Gemini (default model), Textract Disabled ---")
-        try:
-            result_path_g_no_ocr, metrics_g_no_ocr = run_batch_company_analysis(
-                csv_path=standalone_test_csv_path,
-                selected_categories=test_categories,
-                start_year=test_start_year,
-                end_year=test_end_year,
-                ai_model_identifier="gemini-1.5-flash-latest", # Or use GEMINI_MODEL_DEFAULT
-                specific_ai_instructions="Focus on reported turnover and profit before tax figures for the last two available years.",
-                base_scratch_dir=test_scratch_base,
-                keep_days=0,
-                use_textract_ocr=False
-            )
-            if result_path_g_no_ocr: logger.info(f"Gemini (No OCR) Test Output Digest: {result_path_g_no_ocr}")
-            else: logger.error("Gemini (No OCR) Test Run DID NOT produce an output digest path.")
-            logger.info(f"Gemini (No OCR) Test Metrics: {json.dumps(metrics_g_no_ocr, indent=2)}")
-        except Exception as e_test3:
-            logger.error(f"Error during Gemini (No OCR) test: {e_test3}", exc_info=True)
-
-    else:
-        logger.warning("\n--- Skipping Gemini test as GEMINI_API_KEY not set. ---")
-        
-    # Cleanup test files and dirs
     try:
         if standalone_test_csv_path.exists(): standalone_test_csv_path.unlink()
-        if test_csv_dir.exists(): test_csv_dir.rmdir() # Remove dir only if empty
-        # Scratch sub-folders will be cleaned by _cleanup_scratch_directory if keep_days=0
-        # To remove the base scratch dir for testing (if it's empty):
-        # if test_scratch_base.exists() and not any(test_scratch_base.iterdir()): test_scratch_base.rmdir()
-        logger.info(f"Test cleanup: Removed {standalone_test_csv_path.name} and {test_csv_dir.name}. Base scratch: {test_scratch_base} (subfolders cleaned by pipeline).")
-    except Exception as e_cleanup_main:
-        logger.warning(f"Error during main test cleanup: {e_cleanup_main}")
+        if test_csv_dir.exists(): test_csv_dir.rmdir() # Remove the directory itself
+        # Deleting the base scratch dir and its contents needs more care if runs are parallel
+        # For simple test, can try to remove it. For production, keep_days should handle it.
+        # import shutil
+        # if test_scratch_base.exists(): shutil.rmtree(test_scratch_base)
+        logger.info(f"Test cleanup: Removed {standalone_test_csv_path.name} and {test_csv_dir.name}. Base scratch path for manual review if needed: {test_scratch_base}.")
+    except Exception as e_cleanup_main: logger.warning(f"Error during main test cleanup: {e_cleanup_main}")

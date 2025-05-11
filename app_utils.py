@@ -3,20 +3,18 @@
 import json
 import re
 import logging
-from typing import Tuple, Optional, List, Dict
+from typing import Tuple, Optional, List, Dict # Added List, Dict
+import io # Added io
 
 import requests
 from bs4 import BeautifulSoup
 from PyPDF2 import PdfReader
-from docx import Document # Assuming python-docx is installed
-import io
+from docx import Document
 
-from config import get_openai_client, get_ch_session, PROTO_TEXT_FALLBACK # Assuming PROTO_TEXT is here or passed
+# Import PROTO_TEXT_FALLBACK from config
+from config import get_openai_client, get_ch_session, PROTO_TEXT_FALLBACK, logger # Use central logger
 
-logger = logging.getLogger(__name__)
-
-# Fallback protocol text if not loaded from file in app.py
-PROTO_TEXT_FALLBACK = "You are a helpful AI assistant."
+# logger = logging.getLogger(__name__) # Not needed if using central logger from config
 
 
 def _word_cap(word_count: int) -> int:
@@ -31,26 +29,22 @@ def _word_cap(word_count: int) -> int:
 def summarise_with_title(
     text: str,
     model_name_selected: str, # This implies the main app's selected model
-    topic: str, # For context, not used in current prompt
-    protocol_text: str = PROTO_TEXT_FALLBACK
+    topic: str, # For context
+    protocol_text: str # Expect app.py to pass the loaded PROTO_TEXT or the fallback
 ) -> Tuple[str, str]:
     """
     Generates a short title and summary for UI display of uploaded documents.
-    Currently hardcoded to use a specific OpenAI model for this task.
+    Uses a cost-effective OpenAI model for this task.
     """
     if not text or not text.strip():
         return "Empty Content", "No text was provided for summarization."
 
     word_count = len(text.split())
     summary_word_cap = _word_cap(word_count)
-    # Truncate text if extremely long, to protect this specific quick summarizer
-    text_to_summarise = text[:15000] # Increased slightly from 12k
-    max_tokens_for_response = int(summary_word_cap * 1.8) # Allow more tokens for JSON structure and content
+    text_to_summarise = text[:15000]
+    max_tokens_for_response = int(summary_word_cap * 1.8)
 
-    # This specific summarizer is for short titles/summaries for UI display.
-    # It will use a cost-effective OpenAI model by default for this limited task.
-    # Consider making this configurable or using the main selected model if consistency is key.
-    openai_model_for_this_task = "gpt-4o-mini"
+    openai_model_for_this_task = "gpt-4o-mini" # Hardcoded for this specific utility
     openai_client = get_openai_client()
 
     if not openai_client:
@@ -72,7 +66,7 @@ def summarise_with_title(
             temperature=0.2,
             max_tokens=max_tokens_for_response,
             messages=[
-                {"role": "system", "content": protocol_text}, # Use provided or fallback protocol
+                {"role": "system", "content": protocol_text}, # Use the protocol_text passed from app.py
                 {"role": "user", "content": prompt}
             ],
             response_format={"type": "json_object"}
@@ -116,16 +110,15 @@ def fetch_url_content(url: str) -> Tuple[Optional[str], Optional[str]]:
         if main_content_tags:
             content_text = " ".join(tag.get_text(" ", strip=True) for tag in main_content_tags)
         
-        if not content_text.strip() or len(content_text.split()) < 20 : # If main content is too short or empty, try body
+        if not content_text.strip() or len(content_text.split()) < 20 :
             body_tag = soup.find("body")
             if body_tag:
                 content_text = body_tag.get_text(" ", strip=True)
-            else: # Fallback to all text if no body
+            else:
                 content_text = soup.get_text(" ", strip=True)
         
-        # Basic cleaning
         content_text = re.sub(r'\s\s+', ' ', content_text).strip()
-        content_text = re.sub(r'(\n\s*){3,}', '\n\n', content_text).strip() # Reduce multiple blank lines
+        content_text = re.sub(r'(\n\s*){3,}', '\n\n', content_text).strip()
 
         if not content_text.strip():
             logger.info(f"No significant text extracted from URL '{url}' after parsing.")
@@ -142,8 +135,8 @@ def find_company_number(query: str, ch_api_key: Optional[str]) -> Tuple[Optional
     Searches Companies House for a company number.
     Returns (company_number, error_message, first_match_details).
     """
-    ch_session = get_ch_session() # Get the configured session
-    if not ch_api_key: # CH_API_KEY from config is used by get_ch_session, this is an extra check
+    ch_session = get_ch_session()
+    if not ch_api_key:
         return None, "Companies House API Key is missing or not configured.", None
 
     if not query or not query.strip():
@@ -151,28 +144,23 @@ def find_company_number(query: str, ch_api_key: Optional[str]) -> Tuple[Optional
 
     query_cleaned = query.strip().upper()
     
-    # Regex for typical UK company numbers (allows for variations like SC, NI prefixes)
-    # Standard: 8 digits, or 2 letters + 6 digits. Also allows for just 8 alphanumeric.
     company_no_match = re.fullmatch(r"([A-Z]{2})?([0-9]{6,8})|[A-Z0-9]{8}", query_cleaned.replace(" ", ""))
     
     if company_no_match:
-        # Attempt to format it correctly, especially if it's just numbers
         potential_no = query_cleaned.replace(" ", "")
         if potential_no.isdigit() and len(potential_no) <= 8:
             formatted_no = potential_no.zfill(8)
-            if re.fullmatch(r"[0-9]{8}", formatted_no): # Check if it's purely 8 digits
+            if re.fullmatch(r"[0-9]{8}", formatted_no):
                  logger.info(f"Using provided/formatted company number: {formatted_no}")
                  return formatted_no, None, {"company_number": formatted_no, "title": "Input as Number"}
 
-        # If it already matches a more complex pattern (e.g., SC123456 or 8 mixed chars)
-        if re.fullmatch(r"[A-Z0-9]{8}|[A-Z]{2}[0-9]{6}", potential_no): # Strict check after potential zfill
+        if re.fullmatch(r"[A-Z0-9]{8}|[A-Z]{2}[0-9]{6}", potential_no):
             logger.info(f"Using provided company number: {potential_no}")
             return potential_no, None, {"company_number": potential_no, "title": "Input as Number/Code"}
 
-
     logger.info(f"Searching Companies House for name/number: '{query}'")
     search_url = "https://api.company-information.service.gov.uk/search/companies"
-    params = {'q': query_cleaned, 'items_per_page': 5} # Fetch a few for user to see if direct match fails
+    params = {'q': query_cleaned, 'items_per_page': 5}
 
     try:
         response = ch_session.get(search_url, params=params, timeout=15)
@@ -190,13 +178,11 @@ def find_company_number(query: str, ch_api_key: Optional[str]) -> Tuple[Optional
         logger.warning(f"No company found for query '{query}'.")
         return None, f"No company found for '{query}'.", None
 
-    # Prioritize exact match on company number if present in results
     for item in items:
         if item.get("company_number") == query_cleaned:
             logger.info(f"Exact company number match found: {item.get('title')} ({item.get('company_number')})")
             return item.get("company_number"), None, item
 
-    # Fallback to the first result if no exact number match
     first_match = items[0]
     company_number = first_match.get("company_number")
     company_name = first_match.get("title", "N/A")
@@ -216,7 +202,7 @@ def extract_text_from_uploaded_file(file_obj: io.BytesIO, file_name: str) -> Tup
     error_message = None
     
     try:
-        file_obj.seek(0) # Ensure buffer is at the beginning
+        file_obj.seek(0)
         if file_ext == "pdf":
             reader = PdfReader(file_obj)
             text_parts = [page.extract_text() or "" for page in reader.pages if hasattr(page, 'extract_text')]
@@ -231,8 +217,7 @@ def extract_text_from_uploaded_file(file_obj: io.BytesIO, file_name: str) -> Tup
             logger.warning(error_message)
 
         if text_content is not None and not text_content.strip():
-            text_content = None # Treat empty extraction as None
-            # error_message = f"No text extracted from {file_name}." # Optional: report as error
+            text_content = None
             logger.info(f"No text content extracted from {file_name} (empty after extraction).")
         elif text_content:
              logger.info(f"Successfully extracted text from uploaded file: {file_name} ({len(text_content)} chars).")
