@@ -1,0 +1,20 @@
+# Core Streamlit and web
+streamlit
+requests
+beautifulsoup4
+
+# Data handling and document processing
+pandas
+PyPDF2
+pdfminer.six
+python-docx
+openpyxl # Often a dependency for pandas Excel features, good to have
+
+# AI and Cloud Services
+openai
+google-generativeai
+boto3 # For AWS Textract (even if optional, good to list if aws_textract_utils.py is present)
+python-dotenv # For loading .env files
+
+# Other utilities (if any specific versions are needed, add them e.g. some-library==1.2.3)
+# For now, we'll let pip choose the latest compatible versions.

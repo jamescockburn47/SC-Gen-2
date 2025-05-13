@@ -1,3 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+# If you create a venv folder (e.g., 'venv' or '.venv'), uncomment the line below
+# and replace 'venv_folder_name/' with your actual venv folder name.
+# venv_folder_name/
+# .venv/
+
+# IDE / Editor specific
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment variables
+.env
+
 # Log files and temporary files
 logs/
 *.log
@@ -13,9 +33,22 @@ test_ch_pipeline_input.csv # Test file from ch_pipeline
 temp_ch_runs/
 
 # Generated files
-.idea/
-*.swp
-*.swo
+*.pdf
 
-# Environment variables
-.env
+# Exported files
+exports/
+
+# Summaries cache
+summaries/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Streamlit specific
+.streamlit/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
