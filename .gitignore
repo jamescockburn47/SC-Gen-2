@@ -1,0 +1,15 @@
+# Log files and temporary files
+logs/
+*.log
+tmp/
+temp/
+*.tmp
+scratch/ # Generic scratch folder if you create one at root
+ch_pipeline_scratch_*/ # Matches default scratch folders from ch_pipeline
+ch_app_run_*/         # Matches default scratch folders from app.py CH runs
+ch_pipeline_test_*/   # Matches test scratch folders
+test_ch_pipeline_input_standalone.csv # Test file from ch_pipeline
+test_ch_pipeline_input.csv # Test file from ch_pipeline
+temp_ch_runs/
+
+# Generated files
