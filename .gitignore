@@ -13,3 +13,9 @@ test_ch_pipeline_input.csv # Test file from ch_pipeline
 temp_ch_runs/
 
 # Generated files
+.idea/
+*.swp
+*.swo
+
+# Environment variables
+.env
