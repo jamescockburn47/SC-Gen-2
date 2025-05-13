@@ -57,6 +57,7 @@ try:
     )
     from about_page import render_about_page
     from ch_pipeline import run_batch_company_analysis
+    from ai_utils import get_improved_prompt # Added import
     # from ai_utils import _gemini_generate_content_with_retry_and_tokens # Not directly used in app.py typically
 except ImportError as e_app_utils_more:
     st.error(f"Fatal Error: Could not import app utilities or CH pipeline: {e_app_utils_more}")
@@ -131,7 +132,16 @@ def init_session_state():
         "ch_last_narrative": None, "ch_last_batch_metrics": {},
         "consult_digest_model": config.OPENAI_MODEL_DEFAULT,
         "ch_analysis_summaries_for_injection": [], # List of (company_id, title_for_list, summary_text)
-        # selected_ch_summary_texts_for_injection will be populated dynamically by checkboxes
+        
+        # For "Improve Prompt" in Consult Counsel
+        "user_instruction_main_text_area_value": "", # Holds current text area content
+        "original_user_instruction_main": "", 
+        "user_instruction_main_is_improved": False,
+
+        # For "Improve Prompt" in CH Analysis
+        "additional_ai_instructions_ch_text_area_value": "", # Holds current text area content
+        "original_additional_ai_instructions_ch": "", 
+        "additional_ai_instructions_ch_is_improved": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state: st.session_state[key] = value
@@ -358,12 +368,50 @@ tab_consult, tab_ch_analysis, tab_about_rendered = st.tabs(["💬 Consult Counse
 
 with tab_consult:
     st.markdown("Provide instructions and context (using sidebar options) for drafting, analysis, or advice.")
-    user_instruction_main = st.text_area("Your Instruction:", height=200, key="main_instruction_area_consult_tab")
+    
+    # Text area for user's main instruction. Its value is stored in st.session_state.main_instruction_area_consult_tab (by Streamlit)
+    # and mirrored to st.session_state.user_instruction_main_text_area_value by the on_change callback.
+    st.text_area(
+        "Your Instruction:", 
+        value=st.session_state.user_instruction_main_text_area_value, # Display value from our dedicated session state
+        height=200, 
+        key="main_instruction_area_consult_tab", # Key for this specific widget
+        on_change=lambda: st.session_state.update(user_instruction_main_text_area_value=st.session_state.main_instruction_area_consult_tab) # Update our dedicated state from widget's state
+    )
+
+    col_improve_main, col_cancel_main, col_spacer_main = st.columns([2,2,3]) # Adjusted column ratios
+    with col_improve_main:
+        if st.button("💡 Suggest Improved Prompt", key="improve_prompt_main_button", help="Let AI refine your instruction for better results.", use_container_width=True):
+            current_text_in_area = st.session_state.user_instruction_main_text_area_value 
+            if current_text_in_area and current_text_in_area.strip():
+                if not st.session_state.user_instruction_main_is_improved: 
+                    st.session_state.original_user_instruction_main = current_text_in_area
+                
+                with st.spinner("Improving prompt..."):
+                    improved_prompt = get_improved_prompt(current_text_in_area, "Strategic Counsel general query")
+                    if "Error:" not in improved_prompt and improved_prompt.strip():
+                        st.session_state.user_instruction_main_text_area_value = improved_prompt 
+                        st.session_state.user_instruction_main_is_improved = True
+                        st.rerun() 
+                    elif "Error:" in improved_prompt:
+                        st.warning(f"Could not improve prompt: {improved_prompt}")
+                    # If prompt is empty or only whitespace after improvement, no change is made to the text area.
+            else:
+                st.info("Please enter an instruction first to improve it.")
+
+    with col_cancel_main:
+        if st.session_state.user_instruction_main_is_improved:
+            if st.button("↩️ Revert to Original", key="cancel_improve_prompt_main_button", use_container_width=True):
+                st.session_state.user_instruction_main_text_area_value = st.session_state.original_user_instruction_main
+                st.session_state.user_instruction_main_is_improved = False
+                st.rerun()
 
     consult_model_name = st.session_state.get("consult_digest_model")
 
     if st.button("✨ Consult Counsel", type="primary", key="run_ai_button_consult_tab"):
-        if not user_instruction_main.strip(): st.warning("Please enter your instructions.")
+        current_instruction_to_use = st.session_state.user_instruction_main_text_area_value
+
+        if not current_instruction_to_use.strip(): st.warning("Please enter your instructions.")
         elif not consult_model_name: st.error("No AI model selected for Consultation.")
         else:
             with st.spinner(f"Consulting {consult_model_name}..."):
@@ -372,24 +420,21 @@ with tab_consult:
                 if inject_digest_checkbox and st.session_state.latest_digest_content: context_parts_for_ai.append(f"CURRENT DIGEST:\n{st.session_state.latest_digest_content}")
                 if st.session_state.loaded_memories: context_parts_for_ai.append("INJECTED MEMORIES:\n" + "\n---\n".join(st.session_state.loaded_memories))
 
-                # Combine selected summaries from both sources (Uploaded/URL and CH Analysis)
                 combined_selected_summaries = []
-                if st.session_state.selected_summary_texts: # From uploaded docs/URLs
+                if st.session_state.selected_summary_texts: 
                     combined_selected_summaries.extend(st.session_state.selected_summary_texts)
                 
-                # Get currently selected CH summaries for injection (based on dynamic checkbox state)
                 if "ch_analysis_summaries_for_injection" in st.session_state and st.session_state.ch_analysis_summaries_for_injection:
                     for idx, (company_id, title_for_list, summary_text) in enumerate(st.session_state.ch_analysis_summaries_for_injection):
                         ch_checkbox_key = f"ch_sum_sel_{_hashlib.md5(company_id.encode() + title_for_list.encode()).hexdigest()}"
-                        if st.session_state.get(ch_checkbox_key, False): # If checkbox is checked
+                        if st.session_state.get(ch_checkbox_key, False): 
                             combined_selected_summaries.append(f"COMPANIES HOUSE ANALYSIS SUMMARY FOR {company_id} ({title_for_list}):\n{summary_text}")
                 
                 if combined_selected_summaries:
                     context_parts_for_ai.append("SELECTED DOCUMENT SUMMARIES & ANALYSIS:\n" + "\n===\n".join(combined_selected_summaries))
 
-
                 if context_parts_for_ai: messages_for_ai.append({"role": "system", "content": "ADDITIONAL CONTEXT:\n\n" + "\n\n".join(context_parts_for_ai)})
-                messages_for_ai.append({"role": "user", "content": user_instruction_main})
+                messages_for_ai.append({"role": "user", "content": current_instruction_to_use}) # Use the potentially improved instruction
 
                 try:
                     ai_response_text = "Error: AI response could not be generated."
@@ -398,16 +443,15 @@ with tab_consult:
                     if consult_model_name.startswith("gpt-"):
                         openai_client = config.get_openai_client(); assert openai_client
                         ai_api_response = openai_client.chat.completions.create(
-                            model=consult_model_name, temperature=ai_temp, messages=messages_for_ai, max_tokens=3500 # Consider increasing if context is large
+                            model=consult_model_name, temperature=ai_temp, messages=messages_for_ai, max_tokens=3500
                         )
                         ai_response_text = ai_api_response.choices[0].message.content.strip()
                         if ai_api_response.usage:
                             prompt_tokens = ai_api_response.usage.prompt_tokens
                             completion_tokens = ai_api_response.usage.completion_tokens
                     elif consult_model_name.startswith("gemini-"):
-                        gemini_model_client = config.get_gemini_model(consult_model_name); assert gemini_model_client and config.genai # Check config.genai
-
-                        try: # Attempt to count tokens for Gemini
+                        gemini_model_client = config.get_gemini_model(consult_model_name); assert gemini_model_client and config.genai
+                        try: 
                             full_prompt_str_gemini = "\n\n".join([f"{m['role']}: {m['content']}" for m in messages_for_ai])
                             count_resp_prompt = gemini_model_client.count_tokens(full_prompt_str_gemini)
                             prompt_tokens = count_resp_prompt.total_tokens
@@ -415,25 +459,25 @@ with tab_consult:
 
                         gemini_api_response = gemini_model_client.generate_content(
                             contents=messages_for_ai,
-                            generation_config=config.genai.types.GenerationConfig(temperature=ai_temp, max_output_tokens=3500) # Use config.genai
+                            generation_config=config.genai.types.GenerationConfig(temperature=ai_temp, max_output_tokens=3500)
                         )
                         if hasattr(gemini_api_response, 'text') and gemini_api_response.text:
                              ai_response_text = gemini_api_response.text.strip()
-                             try: # Attempt to count completion tokens for Gemini
+                             try: 
                                  count_resp_completion = gemini_model_client.count_tokens(ai_response_text)
                                  completion_tokens = count_resp_completion.total_tokens
                              except Exception as e_gem_count_c: logger.warning(f"Gemini completion token count failed: {e_gem_count_c}"); completion_tokens = 0
                         elif hasattr(gemini_api_response, 'prompt_feedback') and gemini_api_response.prompt_feedback.block_reason:
-                            block_reason_str = config.genai.types.BlockedReason(gemini_api_response.prompt_feedback.block_reason).name # Use config.genai
+                            block_reason_str = config.genai.types.BlockedReason(gemini_api_response.prompt_feedback.block_reason).name
                             ai_response_text = f"Error: Gemini content generation blocked. Reason: {block_reason_str}."
                             logger.error(f"Gemini content blocked. Reason: {block_reason_str}. Feedback: {gemini_api_response.prompt_feedback}")
-                        else: # Malformed or unexpected response
+                        else:
                              ai_response_text = "Error: Gemini response was empty or malformed."
                              logger.error(f"Gemini empty/malformed response: {gemini_api_response}")
                     else:
                         raise ValueError(f"Unsupported model type for consultation: {consult_model_name}")
 
-                    st.session_state.session_history.append(f"Instruction:\n{user_instruction_main}\n\nResponse ({consult_model_name}):\n{ai_response_text}")
+                    st.session_state.session_history.append(f"Instruction:\n{current_instruction_to_use}\n\nResponse ({consult_model_name}):\n{ai_response_text}") # Log the used instruction
                     with st.chat_message("assistant", avatar="⚖️"): st.markdown(ai_response_text)
 
                     with st.expander("📊 Run Details & Export"):
@@ -444,7 +488,7 @@ with tab_consult:
 
                         st.metric("Total Tokens", f"{total_tokens:,}", f"{prompt_tokens:,} prompt + {completion_tokens:,} completion")
                         st.metric("Est. Cost", f"£{cost:.5f}")
-                        if energy_model_wh > 0 and energy_wh > 0: # Only display if meaningful
+                        if energy_model_wh > 0 and energy_wh > 0:
                             st.metric("Est. Energy", f"{energy_wh:.3f}Wh", f"~{(energy_wh / KETTLE_WH * 100):.1f}% Kettle" if KETTLE_WH > 0 else "")
 
                         ts_now_str = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -452,14 +496,14 @@ with tab_consult:
                         docx_export_path = APP_BASE_PATH / "exports" / docx_filename
                         try:
                             doc = Document(); doc.add_heading(f"AI Consultation: {st.session_state.current_topic}",0)
-                            doc.add_paragraph(f"Instruction:\n{user_instruction_main}\n\nResponse ({consult_model_name} @ {ts_now_str}):\n{ai_response_text}")
+                            doc.add_paragraph(f"Instruction:\n{current_instruction_to_use}\n\nResponse ({consult_model_name} @ {ts_now_str}):\n{ai_response_text}") # Use current_instruction_to_use
                             doc.save(docx_export_path)
                             with open(docx_export_path, "rb") as fp_docx: st.download_button("Download .docx", fp_docx, docx_filename, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
                         except Exception as e_docx: st.error(f"DOCX export error: {e_docx}")
 
                         log_filename = f"{st.session_state.current_topic}_{ts_now_str}_log.json"
                         log_export_path = APP_BASE_PATH / "logs" / log_filename
-                        log_data = {"topic":st.session_state.current_topic, "timestamp":ts_now_str, "model":consult_model_name, "temp":ai_temp, "tokens":{"p":prompt_tokens,"c":completion_tokens,"t":total_tokens}, "cost_gbp":cost, "energy_wh":energy_wh, "user_instr":user_instruction_main[:200]+"...", "resp_preview":ai_response_text[:200]+"..."}
+                        log_data = {"topic":st.session_state.current_topic, "timestamp":ts_now_str, "model":consult_model_name, "temp":ai_temp, "tokens":{"p":prompt_tokens,"c":completion_tokens,"t":total_tokens}, "cost_gbp":cost, "energy_wh":energy_wh, "user_instr":current_instruction_to_use[:200]+("..." if len(current_instruction_to_use) > 200 else ""), "resp_preview":ai_response_text[:200]+("..." if len(ai_response_text) > 200 else "")} # Use current_instruction_to_use
                         try: log_export_path.write_text(json.dumps(log_data, indent=2), encoding="utf-8")
                         except Exception as e_log: st.error(f"Log save error: {e_log}")
 
@@ -494,7 +538,41 @@ with tab_ch_analysis:
         start_year_for_pipeline, end_year_for_pipeline = selected_year_range_ch
 
         st.markdown("---"); st.markdown("##### Analysis & Output Options")
-        additional_ai_instructions_ch = st.text_area("Additional AI Summary Instructions", placeholder="Example: Focus on director changes, dividend policy...", key="ch_ai_instructions_textarea_ui", height=100)
+        
+        st.text_area(
+            "Additional AI Summary Instructions", 
+            value=st.session_state.additional_ai_instructions_ch_text_area_value,
+            placeholder="Example: Focus on director changes, dividend policy...", 
+            key="ch_ai_instructions_textarea_ui", 
+            height=100,
+            on_change=lambda: st.session_state.update(additional_ai_instructions_ch_text_area_value=st.session_state.ch_ai_instructions_textarea_ui)
+        )
+
+        col_improve_ch, col_cancel_ch, col_spacer_ch = st.columns([2,2,3]) # Adjusted column ratios
+        with col_improve_ch:
+            if st.button("💡 Suggest Improved Instruction", key="improve_prompt_ch_button", help="Let AI refine your CH analysis instruction.", use_container_width=True):
+                current_text_in_ch_area = st.session_state.additional_ai_instructions_ch_text_area_value
+                if current_text_in_ch_area and current_text_in_ch_area.strip():
+                    if not st.session_state.additional_ai_instructions_ch_is_improved:
+                        st.session_state.original_additional_ai_instructions_ch = current_text_in_ch_area
+                    
+                    with st.spinner("Improving instruction..."):
+                        improved_ch_instruction = get_improved_prompt(current_text_in_ch_area, "Companies House document analysis instruction")
+                        if "Error:" not in improved_ch_instruction and improved_ch_instruction.strip():
+                            st.session_state.additional_ai_instructions_ch_text_area_value = improved_ch_instruction
+                            st.session_state.additional_ai_instructions_ch_is_improved = True
+                            st.rerun()
+                        elif "Error:" in improved_ch_instruction:
+                            st.warning(f"Could not improve CH instruction: {improved_ch_instruction}")
+                else:
+                    st.info("Please enter CH analysis instructions first to improve them.")
+        
+        with col_cancel_ch:
+            if st.session_state.additional_ai_instructions_ch_is_improved:
+                if st.button("↩️ Revert to Original", key="cancel_improve_prompt_ch_button", use_container_width=True):
+                    st.session_state.additional_ai_instructions_ch_text_area_value = st.session_state.original_additional_ai_instructions_ch
+                    st.session_state.additional_ai_instructions_ch_is_improved = False
+                    st.rerun()
 
         st.markdown("---"); st.markdown("##### Content Focusing (Optional)")
         ch_keywords_for_filtering = st.text_input(
@@ -507,6 +585,9 @@ with tab_ch_analysis:
         use_textract_ocr_ch = st.checkbox("Use AWS Textract for PDF OCR", value=False, key="ch_use_textract_checkbox_ui", help="Requires AWS setup.", disabled=not CH_PIPELINE_TEXTRACT_FLAG_FROM_MODULE)
         if not CH_PIPELINE_TEXTRACT_FLAG_FROM_MODULE and use_textract_ocr_ch: st.warning("Textract OCR selected, but backend utilities unavailable."); use_textract_ocr_ch = False # Auto-disable if not available
         keep_temp_files_days_ch = st.slider("Temp File Retention (Days)", 0, 30, 1, key="ch_keep_temp_files_slider_ui")
+
+        max_docs_to_fetch_meta = st.sidebar.number_input("Max initial documents to scan per category (CH meta)", min_value=10, max_value=500, value=100, step=10)
+        target_docs_per_category_in_date_range = st.sidebar.number_input("Target documents per category (within date range)", min_value=1, max_value=100, value=10, step=1) # New input
 
         run_ch_analysis_button_ui = st.button("🚀 Run Companies House Analysis", key="ch_run_analysis_button_ui", use_container_width=True, disabled=not CH_API_KEY_PRESENT)
 
@@ -564,14 +645,17 @@ with tab_ch_analysis:
                     with ch_results_display_container: st.warning("Select document categories."); st.stop()
             # End of input prep, spinner for the main processing
             with st.spinner(f"Running CH analysis (Summaries via Gemini default, Textract: {'On' if use_textract_ocr_ch else 'Off'})..."):
+                current_ch_instruction_to_use = st.session_state.additional_ai_instructions_ch_text_area_value
                 output_digest_file_path, batch_metrics_from_run = run_batch_company_analysis(
                     csv_path=temp_csv_for_pipeline_path, selected_categories=api_categories_for_pipeline,
                     start_year=start_year_for_pipeline, end_year=end_year_for_pipeline,
                     model_prices_gbp=MODEL_PRICES_PER_1K_TOKENS_GBP,
-                    specific_ai_instructions=additional_ai_instructions_ch,
-                    filter_keywords_str=ch_keywords_for_filtering, # Pass keywords
-                    base_scratch_dir=ch_run_scratch_dir.parent, # Pass the parent of the specific run dir
-                    keep_days=keep_temp_files_days_ch
+                    specific_ai_instructions=current_ch_instruction_to_use, # Pass the used instruction
+                    filter_keywords_str=ch_keywords_for_filtering, 
+                    base_scratch_dir=ch_run_scratch_dir.parent, 
+                    keep_days=keep_temp_files_days_ch,
+                    max_docs_to_fetch_meta=max_docs_to_fetch_meta, # Pass new parameter
+                    target_docs_per_category_in_date_range=target_docs_per_category_in_date_range # Pass new parameter
                     # use_textract_ocr is passed to ch_pipeline
                 )
                 st.session_state.ch_last_batch_metrics = batch_metrics_from_run
@@ -605,7 +689,6 @@ with tab_ch_analysis:
                     with ch_results_display_container:
                         if "No companies processed" in batch_metrics_from_run.get("notes",""): st.warning("CH Analysis: No companies processed.")
                         else: st.error("CH Analysis ran, but output CSV not found or was empty.")
-                    st.session_state.ch_last_df = None
             st.rerun() # Rerun to update sidebar with new CH summaries & display results
 
         # Display logic for CH results, always using the ch_results_display_container
@@ -688,7 +771,6 @@ with tab_ch_analysis:
                                     red_flags_full_section = summary_content[actual_heading_start_index:]
                                     
                                     # Split the red flags section from any subsequent standard sections if AI uses them
-                                    # This regex looks for a newline, then number. space, then uppercase word (like "1. FINANCIAL...")
                                     match_next_std_section = re.search(r"\n\s*\d+\.\s+[A-Z]{2,}", red_flags_full_section[len(red_flag_heading_keyword):], re.MULTILINE)
                                     
                                     actual_red_flag_heading_text = red_flags_full_section[:len(red_flag_heading_keyword)]
@@ -696,7 +778,7 @@ with tab_ch_analysis:
 
                                     if match_next_std_section:
                                         red_flag_content_only = red_flags_full_section[len(red_flag_heading_keyword) : len(red_flag_heading_keyword) + match_next_std_section.start()].strip()
-                                        text_after_flags = flags_and_after[len(red_flag_heading_keyword) + match_next_std_section.start():].strip()
+                                        text_after_flags = red_flags_full_section[len(red_flag_heading_keyword) + match_next_std_section.start():].strip() # Corrected variable
                                     else:
                                         text_after_flags = ""
 

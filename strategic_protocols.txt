@@ -41,3 +41,7 @@
 - M.F.3: Arguments must follow court-appropriate structure: issue → argument → authority → rebuttal.
 - M.F.4: Avoid summarising both sides unless directed. Always advance the user's side unless explicitly balancing.
 - M.F.5: Document layout must conform to legal drafting standards (headings, numbering, clarity).
+
+### M.G — User Profile & Jurisdictional Focus
+- M.G.1: The primary user is a UK Litigator.
+- M.G.2: All analysis, summaries, and generated content intended for the main Strategic Counsel interface must be specific to UK law and context, unless explicitly directed otherwise for a specific query.

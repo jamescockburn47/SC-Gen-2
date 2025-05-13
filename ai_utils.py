@@ -4,6 +4,7 @@ import logging
 import json
 import time
 import re
+import random
 from typing import Optional, List, Tuple, Dict
 
 # Attempt to import Google Generative AI
@@ -412,3 +413,74 @@ def gemini_summarise_ch_docs(
             # Return concatenated text if aggregation fails, so user at least gets partial data
             return f"Error during Gemini aggregation: {final_summary}.\n\nConcatenated sub-summaries (some may contain errors):\n{aggregation_input_text}", total_prompt_tokens, total_completion_tokens
         return final_summary, total_prompt_tokens, total_completion_tokens
+
+
+def get_improved_prompt(
+    original_prompt: str,
+    prompt_context: str, # e.g., "Strategic Counsel general query" or "Companies House document analysis instruction"
+    model_name: Optional[str] = None
+) -> str:
+    """
+    Uses an AI model to refine and improve a user's input prompt.
+
+    Args:
+        original_prompt: The user's initial prompt.
+        prompt_context: A description of what the prompt is for.
+        model_name: The specific Gemini model to use.
+
+    Returns:
+        The AI-generated improved prompt string, or an error message.
+    """
+    if not genai_sdk:
+        return "Error: Google Generative AI SDK not installed. Cannot improve prompt."
+
+    current_model_name = model_name or GEMINI_MODEL_DEFAULT 
+    gemini_model_client = get_gemini_model(current_model_name)
+
+    if not gemini_model_client:
+        return f"Error: Could not initialize Gemini model '{current_model_name}' for prompt improvement."
+    if not original_prompt or not original_prompt.strip():
+        return original_prompt # Return original if empty or just whitespace
+
+    logger.info(f"Attempting to improve prompt for context: '{prompt_context}' using {current_model_name}. Original: '{original_prompt[:100]}...'")
+
+    system_instruction = (
+        "You are an expert AI assistant specializing in crafting effective prompts for other AI models. "
+        "The primary user is a UK Litigator, and all outputs should be tailored for this persona, focusing on UK-specific legal and business contexts unless the prompt explicitly states otherwise. "
+        "Your task is to refine the user's input (provided below) to make it a better, more structured, and more effective prompt for an AI that will perform tasks such as legal analysis, document summarization, or research. "
+        "Do NOT answer or execute the user's original prompt. Your sole output should be the improved prompt text itself. "
+        "The improved prompt should:"
+        "\n- Be clear, concise, and unambiguous."
+        "\n- Explicitly state or strongly imply that the context is UK law and UK-based entities if relevant to the original prompt's intent."
+        "\n- If the original prompt is vague, try to make it more specific by adding reasonable assumptions or by structuring it to elicit more detailed information, always from a UK litigator's perspective."
+        "\n- Maintain the core intent of the original prompt."
+        "\n- Be suitable for direct use as input to another advanced AI model."
+        "\n- If the original prompt is already excellent, you can return it with minimal or no changes, perhaps with a brief affirmation like 'This prompt is already well-structured. Using as is:' followed by the prompt."
+        "\n- Do not add conversational fluff or explanations about why you changed the prompt. Only output the refined prompt text."
+    )
+    
+    full_prompt_for_improvement = f"{system_instruction}\n\nUser's Original Prompt (for context: {prompt_context}):\n---\n{original_prompt}\n---\nImproved Prompt:"
+
+    generation_config = genai_sdk.types.GenerationConfig(
+        temperature=0.3, # Slightly creative but still focused
+        max_output_tokens=1024 # Allow ample space for the improved prompt
+    )
+
+    improved_prompt_text, p_tokens, c_tokens = _gemini_generate_content_with_retry_and_tokens(
+        gemini_model_client,
+        [full_prompt_for_improvement], # Pass as a list
+        generation_config,
+        company_no="N/A_PromptImprovement", # Contextual, not a real company_no here
+        context_label="PromptImprovement"
+    )
+
+    if "Error:" in improved_prompt_text or "blocked" in improved_prompt_text.lower():
+        logger.error(f"Failed to improve prompt. AI returned: {improved_prompt_text}")
+        return f"Error: Could not improve prompt. AI service issue: {improved_prompt_text}"
+    
+    # Clean up if the model added an affirmative prefix we asked it to consider
+    if improved_prompt_text.startswith("This prompt is already well-structured. Using as is:"):
+        improved_prompt_text = improved_prompt_text.replace("This prompt is already well-structured. Using as is:", "").strip()
+    
+    logger.info(f"Prompt improvement successful. Tokens P:{p_tokens}/C:{c_tokens}. Improved: '{improved_prompt_text[:100]}...'")
+    return improved_prompt_text.strip()
